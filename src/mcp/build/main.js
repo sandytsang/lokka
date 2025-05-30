@@ -9,6 +9,34 @@ import fetch from 'isomorphic-fetch'; // Required polyfill for Graph client
 import { logger } from "./logger.js";
 // Set up global fetch for the Microsoft Graph client
 global.fetch = fetch;
+// --- Helper: Detect if prompt wants beta endpoint and extract path ---
+function extractBetaInfoFromPrompt(prompt, originalPath) {
+    if (!prompt)
+        return { useBeta: false, cleanPath: originalPath };
+    const lowerPrompt = prompt.toLowerCase();
+    let useBeta = false;
+    let cleanPath = originalPath;
+    // Detect if prompt contains a path with 'beta/' in it
+    const betaPathRegex = /(?:\/|^)(beta\/[a-z0-9\/\-]+)/i;
+    const match = prompt.match(betaPathRegex);
+    if (match && match[1]) {
+        useBeta = true;
+        // Remove 'beta/' from the path if present
+        cleanPath = match[1].replace(/^beta\//i, '');
+    }
+    else if (lowerPrompt.includes("beta endpoint") ||
+        lowerPrompt.includes("microsoft graph beta") ||
+        lowerPrompt.includes("graph api beta") ||
+        lowerPrompt.includes("graph beta") ||
+        lowerPrompt.includes("beta")) {
+        useBeta = true;
+    }
+    // If the original path itself starts with 'beta/', remove it for the API call
+    if (cleanPath.startsWith('beta/')) {
+        cleanPath = cleanPath.replace(/^beta\//i, '');
+    }
+    return { useBeta, cleanPath };
+}
 // Create server instance
 const server = new McpServer({
     name: "Lokka-Microsoft",
@@ -29,8 +57,24 @@ server.tool("Lokka-Microsoft", "A versatile tool to interact with Microsoft APIs
     graphApiVersion: z.enum(["v1.0", "beta"]).optional().default("v1.0").describe("Microsoft Graph API version to use (default: v1.0)"),
     fetchAll: z.boolean().optional().default(false).describe("Set to true to automatically fetch all pages for list results (e.g., users, groups). Default is false."),
     consistencyLevel: z.string().optional().describe("Graph API ConsistencyLevel header. ADVISED to be set to 'eventual' for Graph GET requests using advanced query parameters ($filter, $count, $search, $orderby)."),
-}, async ({ apiType, path, method, apiVersion, subscriptionId, queryParams, body, graphApiVersion, fetchAll, consistencyLevel }) => {
-    logger.info(`Executing Lokka-Microsoft tool with params: apiType=${apiType}, path=${path}, method=${method}, graphApiVersion=${graphApiVersion}, fetchAll=${fetchAll}, consistencyLevel=${consistencyLevel}`);
+    prompt: z.string().optional().describe("The original user prompt, used to detect if beta endpoint should be used."),
+}, async ({ apiType, path, method, apiVersion, subscriptionId, queryParams, body, graphApiVersion, fetchAll, consistencyLevel, prompt }) => {
+    // --- Beta endpoint detection and path cleaning logic ---
+    let effectiveGraphApiVersion;
+    let effectivePath;
+    if (apiType === "graph") {
+        const { useBeta, cleanPath } = extractBetaInfoFromPrompt(prompt, path);
+        effectiveGraphApiVersion = useBeta ? "beta" : graphApiVersion;
+        effectivePath = cleanPath;
+        if (useBeta) {
+            logger.info("Detected request for Microsoft Graph beta endpoint from prompt or path. Using graphApiVersion: beta");
+        }
+    }
+    else {
+        effectiveGraphApiVersion = graphApiVersion;
+        effectivePath = path;
+    }
+    logger.info(`Executing Lokka-Microsoft tool with params: apiType=${apiType}, path=${effectivePath}, method=${method}, graphApiVersion=${effectiveGraphApiVersion}, fetchAll=${fetchAll}, consistencyLevel=${consistencyLevel}`);
     let determinedUrl;
     try {
         let responseData;
@@ -39,9 +83,9 @@ server.tool("Lokka-Microsoft", "A versatile tool to interact with Microsoft APIs
             if (!graphClient) {
                 throw new Error("Graph client not initialized");
             }
-            determinedUrl = `https://graph.microsoft.com/${graphApiVersion}`; // For error reporting
+            determinedUrl = `https://graph.microsoft.com/${effectiveGraphApiVersion}`;
             // Construct the request using the Graph SDK client
-            let request = graphClient.api(path).version(graphApiVersion);
+            let request = graphClient.api(effectivePath).version(effectiveGraphApiVersion);
             // Add query parameters if provided and not empty
             if (queryParams && Object.keys(queryParams).length > 0) {
                 request = request.query(queryParams);
@@ -55,7 +99,7 @@ server.tool("Lokka-Microsoft", "A versatile tool to interact with Microsoft APIs
             switch (method.toLowerCase()) {
                 case 'get':
                     if (fetchAll) {
-                        logger.info(`Fetching all pages for Graph path: ${path}`);
+                        logger.info(`Fetching all pages for Graph path: ${effectivePath}`);
                         // Fetch the first page to get context and initial data
                         const firstPageResponse = await request.get();
                         const odataContext = firstPageResponse['@odata.context']; // Capture context from first page
@@ -77,7 +121,7 @@ server.tool("Lokka-Microsoft", "A versatile tool to interact with Microsoft APIs
                         logger.info(`Finished fetching all Graph pages. Total items: ${allItems.length}`);
                     }
                     else {
-                        logger.info(`Fetching single page for Graph path: ${path}`);
+                        logger.info(`Fetching single page for Graph path: ${effectivePath}`);
                         responseData = await request.get();
                     }
                     break;
@@ -202,7 +246,7 @@ server.tool("Lokka-Microsoft", "A versatile tool to interact with Microsoft APIs
         }
         // --- Format and Return Result ---
         // For all requests, format as text
-        let resultText = `Result for ${apiType} API (${apiType === 'graph' ? graphApiVersion : apiVersion}) - ${method} ${path}:\n\n`;
+        let resultText = `Result for ${apiType} API (${apiType === 'graph' ? effectiveGraphApiVersion : apiVersion}) - ${method} ${effectivePath}:\n\n`;
         resultText += JSON.stringify(responseData, null, 2); // responseData already contains the correct structure for fetchAll Graph case
         // Add pagination note if applicable (only for single page GET)
         if (!fetchAll && method === 'get') {
@@ -216,11 +260,11 @@ server.tool("Lokka-Microsoft", "A versatile tool to interact with Microsoft APIs
         };
     }
     catch (error) {
-        logger.error(`Error in Lokka-Microsoft tool (apiType: ${apiType}, path: ${path}, method: ${method}):`, error); // Added more context to error log
+        logger.error(`Error in Lokka-Microsoft tool (apiType: ${apiType}, path: ${effectivePath}, method: ${method}):`, error); // Added more context to error log
         // Try to determine the base URL even in case of error
         if (!determinedUrl) {
             determinedUrl = apiType === 'graph'
-                ? `https://graph.microsoft.com/${graphApiVersion}`
+                ? `https://graph.microsoft.com/${effectiveGraphApiVersion}`
                 : "https://management.azure.com";
         }
         // Include error body if available from Graph SDK error
