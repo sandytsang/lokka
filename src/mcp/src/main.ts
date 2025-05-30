@@ -11,6 +11,39 @@ import { logger } from "./logger.js";
 // Set up global fetch for the Microsoft Graph client
 (global as any).fetch = fetch;
 
+// --- Helper: Detect if prompt wants beta endpoint and extract path ---
+function extractBetaInfoFromPrompt(prompt: string | undefined, originalPath: string): { useBeta: boolean, cleanPath: string } {
+  if (!prompt) return { useBeta: false, cleanPath: originalPath };
+
+  const lowerPrompt = prompt.toLowerCase();
+  let useBeta = false;
+  let cleanPath = originalPath;
+
+  // Detect if prompt contains a path with 'beta/' in it
+  const betaPathRegex = /(?:\/|^)(beta\/[a-z0-9\/\-]+)/i;
+  const match = prompt.match(betaPathRegex);
+  if (match && match[1]) {
+    useBeta = true;
+    // Remove 'beta/' from the path if present
+    cleanPath = match[1].replace(/^beta\//i, '');
+  } else if (
+    lowerPrompt.includes("beta endpoint") ||
+    lowerPrompt.includes("microsoft graph beta") ||
+    lowerPrompt.includes("graph api beta") ||
+    lowerPrompt.includes("graph beta") ||
+    lowerPrompt.includes("beta")
+  ) {
+    useBeta = true;
+  }
+
+  // If the original path itself starts with 'beta/', remove it for the API call
+  if (cleanPath.startsWith('beta/')) {
+    cleanPath = cleanPath.replace(/^beta\//i, '');
+  }
+
+  return { useBeta, cleanPath };
+}
+
 // Create server instance
 const server = new McpServer({
   name: "Lokka-Microsoft",
@@ -37,6 +70,7 @@ server.tool(
     graphApiVersion: z.enum(["v1.0", "beta"]).optional().default("v1.0").describe("Microsoft Graph API version to use (default: v1.0)"),
     fetchAll: z.boolean().optional().default(false).describe("Set to true to automatically fetch all pages for list results (e.g., users, groups). Default is false."),
     consistencyLevel: z.string().optional().describe("Graph API ConsistencyLevel header. ADVISED to be set to 'eventual' for Graph GET requests using advanced query parameters ($filter, $count, $search, $orderby)."),
+    prompt: z.string().optional().describe("The original user prompt, used to detect if beta endpoint should be used."),
   },
   async ({
     apiType,
@@ -48,7 +82,8 @@ server.tool(
     body,
     graphApiVersion,
     fetchAll,
-    consistencyLevel
+    consistencyLevel,
+    prompt
   }: {
     apiType: "graph" | "azure";
     path: string;
@@ -60,8 +95,25 @@ server.tool(
     graphApiVersion: "v1.0" | "beta";
     fetchAll: boolean;
     consistencyLevel?: string;
+    prompt?: string;
   }) => {
-    logger.info(`Executing Lokka-Microsoft tool with params: apiType=${apiType}, path=${path}, method=${method}, graphApiVersion=${graphApiVersion}, fetchAll=${fetchAll}, consistencyLevel=${consistencyLevel}`);
+    // --- Beta endpoint detection and path cleaning logic ---
+    let effectiveGraphApiVersion: "v1.0" | "beta";
+    let effectivePath: string;
+
+    if (apiType === "graph") {
+      const { useBeta, cleanPath } = extractBetaInfoFromPrompt(prompt, path);
+      effectiveGraphApiVersion = useBeta ? "beta" : graphApiVersion;
+      effectivePath = cleanPath;
+      if (useBeta) {
+        logger.info("Detected request for Microsoft Graph beta endpoint from prompt or path. Using graphApiVersion: beta");
+      }
+    } else {
+      effectiveGraphApiVersion = graphApiVersion;
+      effectivePath = path;
+    }
+
+    logger.info(`Executing Lokka-Microsoft tool with params: apiType=${apiType}, path=${effectivePath}, method=${method}, graphApiVersion=${effectiveGraphApiVersion}, fetchAll=${fetchAll}, consistencyLevel=${consistencyLevel}`);
     let determinedUrl: string | undefined;
 
     try {
@@ -72,10 +124,10 @@ server.tool(
         if (!graphClient) {
           throw new Error("Graph client not initialized");
         }
-        determinedUrl = `https://graph.microsoft.com/${graphApiVersion}`; // For error reporting
+        determinedUrl = `https://graph.microsoft.com/${effectiveGraphApiVersion}`;
 
         // Construct the request using the Graph SDK client
-        let request = graphClient.api(path).version(graphApiVersion);
+        let request = graphClient.api(effectivePath).version(effectiveGraphApiVersion);
 
         // Add query parameters if provided and not empty
         if (queryParams && Object.keys(queryParams).length > 0) {
@@ -92,7 +144,7 @@ server.tool(
         switch (method.toLowerCase()) {
           case 'get':
             if (fetchAll) {
-              logger.info(`Fetching all pages for Graph path: ${path}`);
+              logger.info(`Fetching all pages for Graph path: ${effectivePath}`);
               // Fetch the first page to get context and initial data
               const firstPageResponse: PageCollection = await request.get();
               const odataContext = firstPageResponse['@odata.context']; // Capture context from first page
@@ -118,7 +170,7 @@ server.tool(
               logger.info(`Finished fetching all Graph pages. Total items: ${allItems.length}`);
 
             } else {
-              logger.info(`Fetching single page for Graph path: ${path}`);
+              logger.info(`Fetching single page for Graph path: ${effectivePath}`);
               responseData = await request.get();
             }
             break;
@@ -248,7 +300,7 @@ server.tool(
 
       // --- Format and Return Result ---
       // For all requests, format as text
-      let resultText = `Result for ${apiType} API (${apiType === 'graph' ? graphApiVersion : apiVersion}) - ${method} ${path}:\n\n`;
+      let resultText = `Result for ${apiType} API (${apiType === 'graph' ? effectiveGraphApiVersion : apiVersion}) - ${method} ${effectivePath}:\n\n`;
       resultText += JSON.stringify(responseData, null, 2); // responseData already contains the correct structure for fetchAll Graph case
 
       // Add pagination note if applicable (only for single page GET)
@@ -264,11 +316,11 @@ server.tool(
       };
 
     } catch (error: any) {
-      logger.error(`Error in Lokka-Microsoft tool (apiType: ${apiType}, path: ${path}, method: ${method}):`, error); // Added more context to error log
+      logger.error(`Error in Lokka-Microsoft tool (apiType: ${apiType}, path: ${effectivePath}, method: ${method}):`, error); // Added more context to error log
       // Try to determine the base URL even in case of error
       if (!determinedUrl) {
          determinedUrl = apiType === 'graph'
-           ? `https://graph.microsoft.com/${graphApiVersion}`
+           ? `https://graph.microsoft.com/${effectiveGraphApiVersion}`
            : "https://management.azure.com";
       }
       // Include error body if available from Graph SDK error
